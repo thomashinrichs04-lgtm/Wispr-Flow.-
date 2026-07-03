@@ -5,6 +5,7 @@ numpy>=1.24             # audio buffers
 pynput>=1.7.6           # global hotkey + simulated paste keystroke
 pyperclip>=1.8.2        # clipboard read/write for text injection
 requests>=2.31          # calls the local Ollama HTTP API
+pyyaml>=6.0             # config.yaml (optional — defaults used if absent)
 
 # Ollama itself is a separate install (https://ollama.com), not a pip package:
 #   ollama pull llama3.2:3b

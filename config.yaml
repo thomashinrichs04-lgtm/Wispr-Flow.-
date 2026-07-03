@@ -1,0 +1,32 @@
+# flow configuration — every key is optional; defaults shown.
+# See src/flow.py DEFAULT_CONFIG for the authoritative list.
+
+# "toggle": press hotkey once to start, again to stop.
+# "push_to_talk": hold the hotkey while speaking, release to finish.
+mode: toggle
+
+# Chord of keys held together. Modifiers: ctrl, alt, shift, cmd.
+# Examples: "ctrl+alt", "cmd+shift", "alt+space"
+hotkey: ctrl+alt
+
+# Whisper model: tiny / base / small / medium (bigger = slower + more accurate).
+# "small" is a good default on Apple Silicon. English-only variants like
+# "small.en" are faster if you only dictate in English.
+whisper_model: small
+whisper_compute: int8      # int8 (CPU) / float16 (GPU)
+language: null             # null = autodetect, or "en", "de", ...
+
+# The AI clean-up pass. If Ollama is down or the model missing, flow warns
+# and falls back to raw Whisper transcripts — it never crashes.
+use_ollama: true
+ollama_url: http://localhost:11434
+ollama_model: llama3.2:3b
+ollama_timeout_s: 60
+
+# Uncomment to customize how the LLM rewrites your speech ({text} = transcript):
+# edit_prompt: |
+#   You are a dictation post-processor. ...
+#   Raw transcript:
+#   {text}
+#
+#   Cleaned text:

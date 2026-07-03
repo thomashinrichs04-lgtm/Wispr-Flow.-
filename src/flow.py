@@ -1,103 +1,227 @@
 #!/usr/bin/env python3
 """
-flow — a minimal local Wispr Flow clone.
+flow — a minimal local Wispr Flow clone (macOS-first).
 
 Pipeline:  hotkey → record mic → Whisper (STT) → Ollama (clean-up) → paste at cursor.
-
-This is a Phase-1/2 MVP meant to prove the loop end-to-end, not a polished app.
-See docs/02-architecture-and-roadmap.md for the full plan.
 
 Prereqs
 -------
   1. Ollama running with a small model:   ollama pull llama3.2:3b
-  2. pip install faster-whisper sounddevice pynput pyperclip numpy requests
+  2. pip install -r requirements.txt
 
 Usage
 -----
-  python src/flow.py
-  Press the hotkey (default: Ctrl+Alt) once to start recording, again to stop.
-  The cleaned text is copied to the clipboard and pasted into the focused field.
+  python src/flow.py                 # interactive: global hotkey, paste at cursor
+  python src/flow.py --once         # record ONE utterance (Enter to stop), print result
+  python src/flow.py --wav file.wav # transcribe a wav file, print result (no mic needed)
+  python src/flow.py --no-ollama    # skip the LLM pass, raw Whisper output only
 
-Notes
+Modes (config.yaml → mode):
+  toggle        press hotkey once to start, again to stop
+  push_to_talk  hold hotkey to record, release to stop
+
+macOS
 -----
-  * macOS: grant the terminal/app Accessibility + Microphone permissions.
-  * Linux Wayland: synthetic paste may be blocked; use ydotool/wtype instead.
-  * Set USE_OLLAMA = False to see the raw Whisper transcript with no LLM edit.
+  Grant your terminal app BOTH permissions in System Settings → Privacy & Security:
+    * Microphone            (to record)
+    * Accessibility         (for the global hotkey + Cmd+V paste)
+  flow checks both at startup and tells you exactly what is missing.
 """
 
+import argparse
+import os
 import sys
-import time
 import threading
+import time
 
 import numpy as np
 import requests
-import sounddevice as sd
-import pyperclip
-from pynput import keyboard
 
 # ----------------------------- Config ---------------------------------------
 
-SAMPLE_RATE = 16_000          # Whisper wants 16 kHz mono
-WHISPER_MODEL = "base"        # tiny/base/small/medium — bigger = slower + better
-WHISPER_COMPUTE = "int8"      # int8 (CPU) / float16 (GPU)
-LANGUAGE = None               # None = autodetect, or e.g. "en"
+SAMPLE_RATE = 16_000  # Whisper wants 16 kHz mono
 
-USE_OLLAMA = True
-OLLAMA_URL = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "llama3.2:3b"
+DEFAULT_CONFIG = {
+    # "toggle" (press to start / press to stop) or "push_to_talk" (hold to record)
+    "mode": "toggle",
+    # chord of modifier/regular keys, e.g. "ctrl+alt" or "cmd+shift+space"
+    "hotkey": "ctrl+alt",
+    # tiny / base / small / medium — bigger = slower + more accurate.
+    # "small" is a good default on Apple Silicon.
+    "whisper_model": "small",
+    "whisper_compute": "int8",   # int8 (CPU) / float16 (GPU)
+    "language": None,             # None = autodetect, or "en", "de", ...
+    "use_ollama": True,
+    "ollama_url": "http://localhost:11434",
+    "ollama_model": "llama3.2:3b",
+    "ollama_timeout_s": 60,
+    "edit_prompt": (
+        "You are a dictation post-processor. Rewrite the raw speech-to-text below "
+        "into clean written text. Add correct punctuation and capitalization, remove "
+        "filler words (um, uh, like, you know), and resolve spoken self-corrections "
+        "(e.g. '5pm, actually 6' -> '6pm'; obey 'scratch that'). Do NOT add content, "
+        "answer questions, or explain. Output ONLY the cleaned text.\n\n"
+        "Raw transcript:\n{text}\n\nCleaned text:"
+    ),
+}
 
-# Hotkey: press once to start, again to stop (toggle). Ctrl+Alt held together.
-HOTKEY = {keyboard.Key.ctrl_l, keyboard.Key.alt_l}
 
-EDIT_PROMPT = (
-    "You are a dictation post-processor. Rewrite the raw speech-to-text below "
-    "into clean written text. Add correct punctuation and capitalization, remove "
-    "filler words (um, uh, like, you know), and resolve spoken self-corrections "
-    "(e.g. '5pm, actually 6' -> '6pm'; obey 'scratch that'). Do NOT add content, "
-    "answer questions, or explain. Output ONLY the cleaned text.\n\n"
-    "Raw transcript:\n{text}\n\nCleaned text:"
-)
+def load_config(path: str) -> dict:
+    """Read config.yaml over the defaults. Missing file or missing pyyaml → defaults."""
+    cfg = dict(DEFAULT_CONFIG)
+    if not os.path.exists(path):
+        return cfg
+    try:
+        import yaml  # optional dependency
+    except ImportError:
+        print(f"[config] pyyaml not installed; ignoring {path} and using defaults")
+        return cfg
+    try:
+        with open(path) as f:
+            user = yaml.safe_load(f) or {}
+        unknown = set(user) - set(cfg)
+        if unknown:
+            print(f"[config] ignoring unknown keys: {', '.join(sorted(unknown))}")
+        cfg.update({k: v for k, v in user.items() if k in cfg})
+    except Exception as e:  # noqa: BLE001
+        print(f"[config] could not read {path} ({e}); using defaults")
+    return cfg
+
 
 # ----------------------------- Whisper --------------------------------------
 
-print(f"Loading Whisper model '{WHISPER_MODEL}' ...", flush=True)
-from faster_whisper import WhisperModel  # imported here so config errors surface first
-
-_whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type=WHISPER_COMPUTE)
-print("Whisper ready.", flush=True)
+_whisper = None
 
 
-def transcribe(audio: np.ndarray) -> str:
+def load_whisper(cfg: dict):
+    global _whisper
+    print(f"Loading Whisper model '{cfg['whisper_model']}' ...", flush=True)
+    from faster_whisper import WhisperModel
+
+    try:
+        _whisper = WhisperModel(
+            cfg["whisper_model"], device="cpu", compute_type=cfg["whisper_compute"]
+        )
+    except Exception as e:  # noqa: BLE001 — usually a first-run download failure
+        sys.exit(
+            f"error: could not load Whisper model '{cfg['whisper_model']}' ({e}).\n"
+            "On first run the model is downloaded from Hugging Face, which needs\n"
+            "internet access once; after that flow runs fully offline. Check your\n"
+            "connection, or set a smaller model (e.g. 'tiny') in config.yaml."
+        )
+    print("Whisper ready.", flush=True)
+
+
+def transcribe(audio, cfg: dict) -> str:
+    """audio: float32 numpy array at 16 kHz, or a path to an audio file."""
     segments, _ = _whisper.transcribe(
         audio,
-        language=LANGUAGE,
-        vad_filter=True,               # trims silence -> faster + cleaner
-        beam_size=1,                   # greedy = lower latency
+        language=cfg["language"],
+        vad_filter=True,  # trims silence -> faster + cleaner
+        beam_size=1,      # greedy = lower latency
     )
     return " ".join(s.text.strip() for s in segments).strip()
 
 
 # ----------------------------- Ollama ---------------------------------------
 
-def clean_with_ollama(text: str) -> str:
+def check_ollama(cfg: dict) -> bool:
+    """Return True if Ollama is reachable and the model is available."""
+    base = cfg["ollama_url"].rstrip("/")
+    try:
+        resp = requests.get(f"{base}/api/tags", timeout=3)
+        resp.raise_for_status()
+    except Exception:  # noqa: BLE001
+        print(
+            f"[ollama] not reachable at {base}.\n"
+            f"         Start it with:  ollama serve   (or open the Ollama app)\n"
+            f"         flow will fall back to RAW Whisper transcripts until then."
+        )
+        return False
+    names = [m.get("name", "") for m in resp.json().get("models", [])]
+    want = cfg["ollama_model"]
+    if not any(n == want or n.split(":")[0] == want.split(":")[0] for n in names):
+        print(
+            f"[ollama] model '{want}' not found. Pull it with:\n"
+            f"         ollama pull {want}\n"
+            f"         flow will fall back to RAW transcripts until then."
+        )
+        return False
+    print(f"[ollama] ready ({want} @ {base})")
+    return True
+
+
+def clean_with_ollama(text: str, cfg: dict) -> str:
     if not text:
         return text
     try:
         resp = requests.post(
-            OLLAMA_URL,
+            f"{cfg['ollama_url'].rstrip('/')}/api/generate",
             json={
-                "model": OLLAMA_MODEL,
-                "prompt": EDIT_PROMPT.format(text=text),
+                "model": cfg["ollama_model"],
+                "prompt": cfg["edit_prompt"].format(text=text),
                 "stream": False,
                 "options": {"temperature": 0.2},
             },
-            timeout=60,
+            timeout=cfg["ollama_timeout_s"],
         )
         resp.raise_for_status()
-        return resp.json().get("response", text).strip()
-    except Exception as e:  # noqa: BLE001 — fall back to raw text on any failure
+        cleaned = resp.json().get("response", "").strip()
+        return cleaned or text
+    except Exception as e:  # noqa: BLE001 — never crash the loop; degrade to raw
         print(f"[ollama] skipped ({e}); using raw transcript", flush=True)
         return text
+
+
+# ----------------------------- macOS permission checks ----------------------
+
+def check_accessibility() -> bool:
+    """True if this process may control the keyboard (macOS Accessibility)."""
+    if sys.platform != "darwin":
+        return True
+    try:
+        import ctypes.util
+
+        lib = ctypes.util.find_library("ApplicationServices")
+        appsvc = __import__("ctypes").cdll.LoadLibrary(lib)
+        return bool(appsvc.AXIsProcessTrusted())
+    except Exception:  # noqa: BLE001 — can't determine; don't block
+        return True
+
+
+def check_microphone() -> bool:
+    """Try to open the default input device for a moment."""
+    try:
+        import sounddevice as sd
+
+        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32"):
+            pass
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"[mic] could not open microphone: {e}")
+        return False
+
+
+def first_run_checks(cfg: dict, need_paste: bool) -> bool:
+    """Print exactly what's missing. Returns False if we cannot run at all."""
+    ok = True
+    if not check_microphone():
+        ok = False
+        if sys.platform == "darwin":
+            print(
+                "  → System Settings → Privacy & Security → Microphone:\n"
+                "    enable your terminal app (e.g. Terminal / iTerm), then rerun."
+            )
+    if need_paste and not check_accessibility():
+        ok = False
+        print(
+            "[accessibility] this process is NOT trusted to control the keyboard,\n"
+            "so the global hotkey and Cmd+V paste will not work.\n"
+            "  → System Settings → Privacy & Security → Accessibility:\n"
+            "    enable your terminal app, then rerun flow."
+        )
+    check_ollama(cfg) if cfg["use_ollama"] else None
+    return ok
 
 
 # ----------------------------- Recorder -------------------------------------
@@ -114,6 +238,8 @@ class Recorder:
         self._frames.append(indata.copy())
 
     def start(self):
+        import sounddevice as sd
+
         self._frames = []
         self.recording = True
         self._stream = sd.InputStream(
@@ -121,13 +247,13 @@ class Recorder:
             callback=self._callback,
         )
         self._stream.start()
-        print("● recording... (press hotkey again to stop)", flush=True)
 
     def stop(self) -> np.ndarray:
         self.recording = False
-        self._stream.stop()
-        self._stream.close()
-        self._stream = None
+        if self._stream is not None:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
         if not self._frames:
             return np.zeros(0, dtype=np.float32)
         return np.concatenate(self._frames, axis=0).flatten()
@@ -135,13 +261,13 @@ class Recorder:
 
 # ----------------------------- Injection ------------------------------------
 
-_kbd = keyboard.Controller()
-
-
 def paste_text(text: str):
-    """Copy to clipboard and simulate paste, restoring the previous clipboard."""
+    """Copy to clipboard and simulate Cmd/Ctrl+V, restoring the previous clipboard."""
     if not text:
         return
+    import pyperclip
+    from pynput import keyboard
+
     try:
         previous = pyperclip.paste()
     except Exception:  # noqa: BLE001
@@ -149,10 +275,11 @@ def paste_text(text: str):
     pyperclip.copy(text)
     time.sleep(0.05)
 
+    kbd = keyboard.Controller()
     paste_mod = keyboard.Key.cmd if sys.platform == "darwin" else keyboard.Key.ctrl
-    with _kbd.pressed(paste_mod):
-        _kbd.press("v")
-        _kbd.release("v")
+    with kbd.pressed(paste_mod):
+        kbd.press("v")
+        kbd.release("v")
 
     # give the target app a moment to read the clipboard before we restore it
     time.sleep(0.15)
@@ -162,67 +289,157 @@ def paste_text(text: str):
         pass
 
 
+# ----------------------------- Hotkey parsing --------------------------------
+
+def parse_hotkey(spec: str) -> set:
+    """'ctrl+alt' -> {'ctrl', 'alt'}. Names are canonical (no left/right)."""
+    keys = {part.strip().lower() for part in spec.split("+") if part.strip()}
+    if not keys:
+        raise ValueError(f"empty hotkey spec: {spec!r}")
+    return keys
+
+
+def key_name(key) -> str:
+    """Canonical name for a pynput key: ctrl_l/ctrl_r -> 'ctrl', 'A' -> 'a'."""
+    from pynput import keyboard
+
+    if isinstance(key, keyboard.Key):
+        name = key.name
+        for base in ("ctrl", "alt", "shift", "cmd"):
+            if name.startswith(base):
+                return base
+        return name
+    try:
+        return key.char.lower()
+    except AttributeError:
+        return str(key)
+
+
 # ----------------------------- Orchestration --------------------------------
 
-recorder = Recorder()
-_busy = threading.Lock()
-
-
-def handle_stop_and_process():
-    audio = recorder.stop()
-    if audio.size == 0:
+def process_audio(audio, cfg: dict, do_paste: bool):
+    if isinstance(audio, np.ndarray) and audio.size == 0:
         print("(no audio captured)", flush=True)
         return
     print("… transcribing", flush=True)
-    raw = transcribe(audio)
+    raw = transcribe(audio, cfg)
     print(f"raw: {raw!r}", flush=True)
-    final = clean_with_ollama(raw) if USE_OLLAMA else raw
+    final = clean_with_ollama(raw, cfg) if cfg["use_ollama"] else raw
     print(f"out: {final!r}", flush=True)
-    paste_text(final)
-    print("✓ pasted\n", flush=True)
+    if do_paste:
+        paste_text(final)
+        print("✓ pasted\n", flush=True)
 
 
-def toggle():
-    # run processing off the listener thread so hotkeys stay responsive
-    if not _busy.acquire(blocking=False):
-        return
-    try:
-        if recorder.recording:
-            handle_stop_and_process()
-        else:
-            recorder.start()
-    finally:
-        _busy.release()
+def run_interactive(cfg: dict):
+    from pynput import keyboard
 
+    chord = parse_hotkey(cfg["hotkey"])
+    ptt = cfg["mode"] == "push_to_talk"
+    recorder = Recorder()
+    busy = threading.Lock()
+    pressed: set = set()
+    fired = False  # edge detection: chord fires once per full press
 
-# --- global hotkey detection (chord: all keys in HOTKEY held together) -------
+    def start_recording():
+        recorder.start()
+        print("● recording..." + ("" if ptt else " (press hotkey again to stop)"),
+              flush=True)
 
-_pressed = set()
-_fired = False
+    def stop_and_process():
+        audio = recorder.stop()
+        process_audio(audio, cfg, do_paste=True)
 
+    def dispatch(action):
+        def run():
+            if not busy.acquire(blocking=False):
+                return
+            try:
+                action()
+            finally:
+                busy.release()
+        threading.Thread(target=run, daemon=True).start()
 
-def on_press(key):
-    global _fired
-    if key in HOTKEY:
-        _pressed.add(key)
-        if _pressed >= HOTKEY and not _fired:
-            _fired = True
-            threading.Thread(target=toggle, daemon=True).start()
+    def on_press(key):
+        nonlocal fired
+        pressed.add(key_name(key))
+        if pressed >= chord and not fired:
+            fired = True
+            if ptt:
+                if not recorder.recording:
+                    dispatch(start_recording)
+            else:
+                dispatch(stop_and_process if recorder.recording else start_recording)
 
+    def on_release(key):
+        nonlocal fired
+        pressed.discard(key_name(key))
+        if not (pressed >= chord):
+            fired = False
+            if ptt and recorder.recording:
+                dispatch(stop_and_process)
 
-def on_release(key):
-    global _fired
-    _pressed.discard(key)
-    if not (_pressed >= HOTKEY):
-        _fired = False
-
-
-def main():
-    mode = "Whisper + Ollama" if USE_OLLAMA else "Whisper only"
-    print(f"\nflow ready ({mode}). Hotkey: Ctrl+Alt (toggle). Ctrl+C to quit.\n",
+    mode_desc = "hold to talk" if ptt else "toggle"
+    llm = f"Whisper + Ollama ({cfg['ollama_model']})" if cfg["use_ollama"] else "Whisper only"
+    print(f"\nflow ready ({llm}). Hotkey: {cfg['hotkey']} ({mode_desc}). Ctrl+C to quit.\n",
           flush=True)
     with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
         listener.join()
+
+
+def run_once(cfg: dict):
+    """Record a single utterance from the mic; Enter stops. Prints, no paste."""
+    recorder = Recorder()
+    recorder.start()
+    print("● recording — press Enter to stop", flush=True)
+    try:
+        input()
+    except (EOFError, KeyboardInterrupt):
+        pass
+    process_audio(recorder.stop(), cfg, do_paste=False)
+
+
+def run_wav(cfg: dict, path: str):
+    """Transcribe an audio file — end-to-end test with no mic or GUI needed."""
+    process_audio(path, cfg, do_paste=False)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="flow — local Wispr Flow clone")
+    ap.add_argument("--config", default=os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml"),
+        help="path to config.yaml")
+    ap.add_argument("--once", action="store_true",
+                    help="record one utterance (Enter to stop), print result, exit")
+    ap.add_argument("--wav", metavar="FILE",
+                    help="transcribe an audio file and print result (no mic needed)")
+    ap.add_argument("--no-ollama", action="store_true",
+                    help="skip the LLM pass; raw Whisper output only")
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+    if args.no_ollama:
+        cfg["use_ollama"] = False
+    if cfg["mode"] not in ("toggle", "push_to_talk"):
+        sys.exit(f"error: config 'mode' must be toggle or push_to_talk, got {cfg['mode']!r}")
+
+    if args.wav:
+        if not os.path.exists(args.wav):
+            sys.exit(f"error: file not found: {args.wav}")
+        if cfg["use_ollama"]:
+            check_ollama(cfg)
+        load_whisper(cfg)
+        run_wav(cfg, args.wav)
+        return
+
+    # live-mic paths need permission checks before loading anything heavy
+    if not first_run_checks(cfg, need_paste=not args.once):
+        sys.exit(1)
+    load_whisper(cfg)
+    if args.once:
+        run_once(cfg)
+    else:
+        run_interactive(cfg)
 
 
 if __name__ == "__main__":
