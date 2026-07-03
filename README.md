@@ -23,6 +23,15 @@ cursor — running **fully on your machine** with no cloud and no subscription.
 
 ## Quickstart
 
+**One command** (checks your setup, runs the test suite, then runs the REAL
+Whisper + Ollama pipeline on a bundled speech sample — no mic needed):
+
+```bash
+bash scripts/verify_mac.sh
+```
+
+Or step by step:
+
 ```bash
 # 1. Install Ollama (https://ollama.com) and pull a small, fast model
 ollama pull llama3.2:3b
