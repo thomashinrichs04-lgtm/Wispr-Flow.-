@@ -348,6 +348,12 @@ def run_interactive(cfg: dict):
 
     def stop_and_process():
         audio = recorder.stop()
+        # Wait for the user to release the hotkey chord before we paste —
+        # otherwise the synthetic Cmd+V lands as e.g. Ctrl+Alt+Cmd+V and the
+        # target app ignores it.
+        deadline = time.time() + 2.0
+        while pressed and time.time() < deadline:
+            time.sleep(0.05)
         process_audio(audio, cfg, do_paste=True)
 
     def dispatch(action):
