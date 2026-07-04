@@ -5,9 +5,11 @@
 # "push_to_talk": hold the hotkey while speaking, release to finish.
 mode: toggle
 
-# Chord of keys held together. Modifiers: ctrl, alt, shift, cmd.
-# Examples: "ctrl+alt", "cmd+shift", "alt+space"
-hotkey: ctrl+alt
+# Chord of keys held together. Modifiers: ctrl, alt, shift, cmd,
+# and on macOS "fn" (the fn/globe key). Examples: "fn", "ctrl+alt", "cmd+shift"
+# NOTE for "fn": set System Settings → Keyboard → "Press 🌐 key to" → "Do Nothing"
+# so macOS doesn't also trigger input-source switching or Apple dictation.
+hotkey: fn
 
 # Whisper model: tiny / base / small / medium (bigger = slower + more accurate).
 # "small" is a good default on Apple Silicon. English-only variants like
@@ -23,10 +25,8 @@ ollama_url: http://localhost:11434
 ollama_model: llama3.2:3b
 ollama_timeout_s: 60
 
-# Uncomment to customize how the LLM rewrites your speech ({text} = transcript):
+# Uncomment to customize how the LLM rewrites your speech. This is the system
+# prompt; the raw transcript is sent separately as the user message.
 # edit_prompt: |
-#   You are a dictation post-processor. ...
-#   Raw transcript:
-#   {text}
-#
-#   Cleaned text:
+#   You are a dictation post-processor. Rewrite the user's raw speech-to-text
+#   message into clean written text. ...

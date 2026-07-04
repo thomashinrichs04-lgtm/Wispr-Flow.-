@@ -28,14 +28,15 @@ class MockOllama(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
-        assert self.path == "/api/generate", self.path
+        assert self.path == "/api/chat", self.path
         req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-        # sanity: the edit prompt made it through with the transcript embedded
-        assert "dictation post-processor" in req["prompt"], req["prompt"][:80]
-        assert "um so hello world" in req["prompt"]
+        # sanity: system prompt + transcript as the user message
+        msgs = {m["role"]: m["content"] for m in req["messages"]}
+        assert "dictation post-processor" in msgs["system"], msgs["system"][:80]
+        assert msgs["user"] == "um so hello world", msgs["user"]
         assert req["model"] == "llama3.2:3b"
         assert req["options"]["temperature"] == 0.2
-        body = json.dumps({"response": "Hello, world."}).encode()
+        body = json.dumps({"message": {"role": "assistant", "content": "Hello, world."}}).encode()
         self.send_response(200)
         self.end_headers()
         self.wfile.write(body)

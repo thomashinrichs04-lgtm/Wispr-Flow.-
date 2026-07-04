@@ -55,13 +55,17 @@ DEFAULT_CONFIG = {
     "ollama_url": "http://localhost:11434",
     "ollama_model": "llama3.2:3b",
     "ollama_timeout_s": 60,
+    # System prompt for the clean-up pass. The raw transcript is sent as the
+    # user message (small models reliably ignore transcripts embedded in one
+    # big /api/generate prompt, so we use /api/chat with a system/user split).
     "edit_prompt": (
-        "You are a dictation post-processor. Rewrite the raw speech-to-text below "
-        "into clean written text. Add correct punctuation and capitalization, remove "
-        "filler words (um, uh, like, you know), and resolve spoken self-corrections "
-        "(e.g. '5pm, actually 6' -> '6pm'; obey 'scratch that'). Do NOT add content, "
-        "answer questions, or explain. Output ONLY the cleaned text.\n\n"
-        "Raw transcript:\n{text}\n\nCleaned text:"
+        "You are a dictation post-processor. The user's message is a raw "
+        "speech-to-text transcript. Return it VERBATIM — the same words in the "
+        "same order — with only these fixes: correct punctuation and "
+        "capitalization, remove filler words (um, uh, like, you know), and apply "
+        "spoken self-corrections (e.g. '5pm, actually 6' -> '6pm'; obey 'scratch "
+        "that'). Never paraphrase, reword, shorten, expand, answer questions, or "
+        "add comments. Output ONLY the corrected transcript."
     ),
 }
 
@@ -156,17 +160,20 @@ def clean_with_ollama(text: str, cfg: dict) -> str:
         return text
     try:
         resp = requests.post(
-            f"{cfg['ollama_url'].rstrip('/')}/api/generate",
+            f"{cfg['ollama_url'].rstrip('/')}/api/chat",
             json={
                 "model": cfg["ollama_model"],
-                "prompt": cfg["edit_prompt"].format(text=text),
+                "messages": [
+                    {"role": "system", "content": cfg["edit_prompt"]},
+                    {"role": "user", "content": text},
+                ],
                 "stream": False,
                 "options": {"temperature": 0.2},
             },
             timeout=cfg["ollama_timeout_s"],
         )
         resp.raise_for_status()
-        cleaned = resp.json().get("response", "").strip()
+        cleaned = resp.json().get("message", {}).get("content", "").strip()
         return cleaned or text
     except Exception as e:  # noqa: BLE001 — never crash the loop; degrade to raw
         print(f"[ollama] skipped ({e}); using raw transcript", flush=True)
@@ -231,11 +238,13 @@ class Recorder:
         self._frames = []
         self._stream = None
         self.recording = False
+        self.level = 0.0  # live RMS of the last audio block (for the overlay)
 
     def _callback(self, indata, frames, time_info, status):  # noqa: ARG002
         if status:
             print(f"[audio] {status}", flush=True)
         self._frames.append(indata.copy())
+        self.level = float(np.sqrt(np.mean(indata ** 2)))
 
     def start(self):
         import sounddevice as sd
@@ -257,6 +266,104 @@ class Recorder:
         if not self._frames:
             return np.zeros(0, dtype=np.float32)
         return np.concatenate(self._frames, axis=0).flatten()
+
+
+# ----------------------------- Wave overlay ---------------------------------
+
+class WaveOverlay:
+    """Small floating pill with animated noise waves (styled after
+    docs/noisewaves.png: layered teal→white→pink waves on dark grey).
+
+    Tk must run on the main thread on macOS, so interactive mode runs this
+    mainloop in the foreground and the hotkey listener in a thread. Other
+    threads only touch `.phase` ("idle" | "recording" | "thinking") and
+    read `recorder.level`; the overlay polls both from a Tk timer.
+    """
+
+    W, H = 230, 60
+    FPS_MS = 33
+    BG = "#2e2e30"
+    COLORS = ("#8ff0dd", "#e9e9ec", "#f2a9c8")  # teal / white / pink
+
+    def __init__(self, recorder: "Recorder"):
+        import tkinter as tk
+
+        self.recorder = recorder
+        self.phase = "idle"
+        self._smooth = 0.0
+        self._t = 0.0
+        self._visible = False
+
+        root = tk.Tk()
+        root.withdraw()
+        root.overrideredirect(True)  # no title bar / border
+        for attr, val in (("-topmost", True), ("-alpha", 0.93)):
+            try:
+                root.attributes(attr, val)
+            except tk.TclError:
+                pass
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        root.geometry(f"{self.W}x{self.H}+{(sw - self.W) // 2}+{sh - self.H - 80}")
+        self.canvas = tk.Canvas(root, width=self.W, height=self.H,
+                                bg=self.BG, highlightthickness=0)
+        self.canvas.pack()
+        self.root = root
+        root.after(self.FPS_MS, self._tick)
+
+    def _tick(self):
+        if self.phase == "idle":
+            if self._visible:
+                self.root.withdraw()
+                self._visible = False
+        else:
+            if not self._visible:
+                self.root.deiconify()
+                self.root.lift()
+                self._visible = True
+            self._draw()
+        self.root.after(self.FPS_MS, self._tick)
+
+    def _draw(self):
+        import math
+
+        # amplitude follows the mic while recording; gentle idle pulse while
+        # transcribing so the pill shows flow is still working
+        if self.phase == "recording":
+            target = min(1.0, self.recorder.level * 14.0)
+        else:
+            target = 0.18 + 0.08 * math.sin(self._t * 0.5)
+        self._smooth += (target - self._smooth) * 0.25
+        self._t += 0.22
+
+        c = self.canvas
+        c.delete("wave")
+        mid = self.H / 2
+        n = 44  # points per line
+        for wi, color in enumerate(self.COLORS):
+            for sub in range(3):  # 3 offset strands per color -> mesh look
+                pts = []
+                for i in range(n + 1):
+                    u = i / n
+                    env = math.sin(math.pi * u) ** 0.8  # taper at both ends
+                    amp = (7 + 5 * wi + 2 * sub) * (0.18 + 0.82 * self._smooth)
+                    y = mid + env * amp * math.sin(
+                        2 * math.pi * u * (1.4 + 0.5 * wi)
+                        + self._t * (1.0 + 0.18 * wi) + wi * 2.1 + sub * 0.4)
+                    pts += [u * self.W, y]
+                c.create_line(*pts, fill=color, width=1, smooth=True, tags="wave")
+
+    def run(self):
+        self.root.mainloop()
+
+
+def make_overlay(recorder: "Recorder"):
+    """Overlay or None — flow works fine without a GUI (headless/SSH/no Tk)."""
+    try:
+        return WaveOverlay(recorder)
+    except Exception as e:  # noqa: BLE001
+        print(f"[overlay] disabled ({e}); running without the wave indicator",
+              flush=True)
+        return None
 
 
 # ----------------------------- Injection ------------------------------------
@@ -309,6 +416,9 @@ def key_name(key) -> str:
             if name.startswith(base):
                 return base
         return name
+    # the fn/globe key has no pynput Key; macOS reports it as vk 63 (kVK_Function)
+    if sys.platform == "darwin" and getattr(key, "vk", None) == 0x3F:
+        return "fn"
     try:
         return key.char.lower()
     except AttributeError:
@@ -343,7 +453,7 @@ class FlowEngine:
         self.on_status = on_status or (lambda state: None)
         self.chord = parse_hotkey(cfg["hotkey"])
         self.ptt = cfg["mode"] == "push_to_talk"
-        self._recorder = Recorder()
+        self.recorder = Recorder()  # public: the wave overlay reads .level
         self._busy = threading.Lock()
         self._pressed: set = set()
         self._fired = False
@@ -356,12 +466,12 @@ class FlowEngine:
             pass
 
     def _start_recording(self):
-        self._recorder.start()
+        self.recorder.start()
         self._status("recording")
         print("● recording...", flush=True)
 
     def _stop_and_process(self):
-        audio = self._recorder.stop()
+        audio = self.recorder.stop()
         # Wait for the chord to be released before pasting, else the synthetic
         # Cmd+V lands as e.g. Ctrl+Alt+Cmd+V and the target app ignores it.
         deadline = time.time() + 2.0
@@ -388,11 +498,11 @@ class FlowEngine:
         if self._pressed >= self.chord and not self._fired:
             self._fired = True
             if self.ptt:
-                if not self._recorder.recording:
+                if not self.recorder.recording:
                     self._dispatch(self._start_recording)
             else:
                 self._dispatch(
-                    self._stop_and_process if self._recorder.recording
+                    self._stop_and_process if self.recorder.recording
                     else self._start_recording
                 )
 
@@ -400,7 +510,7 @@ class FlowEngine:
         self._pressed.discard(key_name(key))
         if not (self._pressed >= self.chord):
             self._fired = False
-            if self.ptt and self._recorder.recording:
+            if self.ptt and self.recorder.recording:
                 self._dispatch(self._stop_and_process)
 
     def start(self):
@@ -420,12 +530,22 @@ class FlowEngine:
 
 def run_interactive(cfg: dict):
     engine = FlowEngine(cfg)
+    overlay = make_overlay(engine.recorder)
+    if overlay is not None:
+        # engine states ("idle"/"recording"/"thinking") drive the wave pill
+        engine.on_status = lambda state: setattr(overlay, "phase", state)
     listener = engine.start()
     mode_desc = "hold to talk" if engine.ptt else "toggle"
     llm = f"Whisper + Ollama ({cfg['ollama_model']})" if cfg["use_ollama"] else "Whisper only"
     print(f"\nflow ready ({llm}). Hotkey: {cfg['hotkey']} ({mode_desc}). Ctrl+C to quit.\n",
           flush=True)
-    listener.join()
+    try:
+        if overlay is not None:
+            overlay.run()  # Tk needs the main thread on macOS
+        else:
+            listener.join()
+    finally:
+        engine.stop()
 
 
 def run_once(cfg: dict):
