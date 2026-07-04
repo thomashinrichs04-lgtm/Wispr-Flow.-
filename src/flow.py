@@ -331,66 +331,101 @@ def process_audio(audio, cfg: dict, do_paste: bool):
         print("✓ pasted\n", flush=True)
 
 
-def run_interactive(cfg: dict):
-    from pynput import keyboard
+class FlowEngine:
+    """Hotkey → record → transcribe → clean → paste, reusable by the terminal
+    runner and the menu-bar app. Reports state changes via on_status(state):
+    one of "idle", "recording", "thinking". Non-blocking: start() returns a
+    running pynput listener that the caller keeps alive (join() or an app loop).
+    """
 
-    chord = parse_hotkey(cfg["hotkey"])
-    ptt = cfg["mode"] == "push_to_talk"
-    recorder = Recorder()
-    busy = threading.Lock()
-    pressed: set = set()
-    fired = False  # edge detection: chord fires once per full press
+    def __init__(self, cfg: dict, on_status=None):
+        self.cfg = cfg
+        self.on_status = on_status or (lambda state: None)
+        self.chord = parse_hotkey(cfg["hotkey"])
+        self.ptt = cfg["mode"] == "push_to_talk"
+        self._recorder = Recorder()
+        self._busy = threading.Lock()
+        self._pressed: set = set()
+        self._fired = False
+        self._listener = None
 
-    def start_recording():
-        recorder.start()
-        print("● recording..." + ("" if ptt else " (press hotkey again to stop)"),
-              flush=True)
+    def _status(self, state):
+        try:
+            self.on_status(state)
+        except Exception:  # noqa: BLE001 — UI callback must never break the engine
+            pass
 
-    def stop_and_process():
-        audio = recorder.stop()
-        # Wait for the user to release the hotkey chord before we paste —
-        # otherwise the synthetic Cmd+V lands as e.g. Ctrl+Alt+Cmd+V and the
-        # target app ignores it.
+    def _start_recording(self):
+        self._recorder.start()
+        self._status("recording")
+        print("● recording...", flush=True)
+
+    def _stop_and_process(self):
+        audio = self._recorder.stop()
+        # Wait for the chord to be released before pasting, else the synthetic
+        # Cmd+V lands as e.g. Ctrl+Alt+Cmd+V and the target app ignores it.
         deadline = time.time() + 2.0
-        while pressed and time.time() < deadline:
+        while self._pressed and time.time() < deadline:
             time.sleep(0.05)
-        process_audio(audio, cfg, do_paste=True)
+        self._status("thinking")
+        try:
+            process_audio(audio, self.cfg, do_paste=True)
+        finally:
+            self._status("idle")
 
-    def dispatch(action):
+    def _dispatch(self, action):
         def run():
-            if not busy.acquire(blocking=False):
+            if not self._busy.acquire(blocking=False):
                 return
             try:
                 action()
             finally:
-                busy.release()
+                self._busy.release()
         threading.Thread(target=run, daemon=True).start()
 
-    def on_press(key):
-        nonlocal fired
-        pressed.add(key_name(key))
-        if pressed >= chord and not fired:
-            fired = True
-            if ptt:
-                if not recorder.recording:
-                    dispatch(start_recording)
+    def _on_press(self, key):
+        self._pressed.add(key_name(key))
+        if self._pressed >= self.chord and not self._fired:
+            self._fired = True
+            if self.ptt:
+                if not self._recorder.recording:
+                    self._dispatch(self._start_recording)
             else:
-                dispatch(stop_and_process if recorder.recording else start_recording)
+                self._dispatch(
+                    self._stop_and_process if self._recorder.recording
+                    else self._start_recording
+                )
 
-    def on_release(key):
-        nonlocal fired
-        pressed.discard(key_name(key))
-        if not (pressed >= chord):
-            fired = False
-            if ptt and recorder.recording:
-                dispatch(stop_and_process)
+    def _on_release(self, key):
+        self._pressed.discard(key_name(key))
+        if not (self._pressed >= self.chord):
+            self._fired = False
+            if self.ptt and self._recorder.recording:
+                self._dispatch(self._stop_and_process)
 
-    mode_desc = "hold to talk" if ptt else "toggle"
+    def start(self):
+        from pynput import keyboard
+
+        self._listener = keyboard.Listener(
+            on_press=self._on_press, on_release=self._on_release
+        )
+        self._listener.start()
+        self._status("idle")
+        return self._listener
+
+    def stop(self):
+        if self._listener is not None:
+            self._listener.stop()
+
+
+def run_interactive(cfg: dict):
+    engine = FlowEngine(cfg)
+    listener = engine.start()
+    mode_desc = "hold to talk" if engine.ptt else "toggle"
     llm = f"Whisper + Ollama ({cfg['ollama_model']})" if cfg["use_ollama"] else "Whisper only"
     print(f"\nflow ready ({llm}). Hotkey: {cfg['hotkey']} ({mode_desc}). Ctrl+C to quit.\n",
           flush=True)
-    with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
-        listener.join()
+    listener.join()
 
 
 def run_once(cfg: dict):

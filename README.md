@@ -77,6 +77,29 @@ python src/flow.py --no-ollama      # raw Whisper output (compare vs. cleaned)
 If Ollama is down or the model isn't pulled, flow warns with the exact command
 to fix it and keeps working with raw transcripts — it never crashes mid-dictation.
 
+## Running without a terminal (macOS)
+
+The CLI (`python3 src/flow.py`) runs in the foreground — closing the terminal
+stops it. To use flow like a real background app instead:
+
+```bash
+pip install rumps
+python3 src/flow_menubar.py          # adds a 🎙️ menu-bar icon; no window to keep open
+```
+
+The icon shows state (🎙️ ready · 🔴 recording · ✨ thinking) and has a Quit menu.
+It uses the same engine as the CLI, so the hotkey and pipeline are identical.
+
+To start it automatically at login (fully hands-off, no Terminal ever):
+
+```bash
+bash scripts/install_launchagent.sh          # install + start
+bash scripts/install_launchagent.sh --remove # undo
+```
+
+Either way it runs **entirely on your Mac** — no cloud, no internet after the
+one-time model download.
+
 ## Status
 
 Working MVP: hotkey (toggle **and** push-to-talk) → Whisper → Ollama clean-up →
